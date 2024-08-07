@@ -38,7 +38,8 @@ typedef struct {
 	int height;
 	int imagesize;
 	unsigned char *data;
-	void *dma_buf_in;
+	char *dma_buf_in;
+	char *dma_buf_out;
 } textureImage;
 
 /* simple loader for 24bit bitmaps (data is in rgb-format) - NeHe tutorials */
@@ -147,6 +148,7 @@ static const GLchar* vertex_shader_source =
 static const GLchar* fragment_shader_source =
 	"#version 300 es\n"
 	"#extension GL_OES_EGL_image_external : require\n"
+	"#extension GL_OES_EGL_image_external_essl3 : enable\n"
 	"precision mediump float;\n"
 	"uniform samplerExternalOES uSampler;\n"
 	"in vec2 v_texCoord;\n"
@@ -165,6 +167,21 @@ static const GLfloat uv_coords[][4][2] =
 	{ {0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {1.0, 1.0} }
 };
 
+void shader_dump_log(GLint shader, const char *shader_name)
+{
+	GLint sizeLog = 0;
+	GLchar *infoLog;
+
+	glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &sizeLog);
+	infoLog = malloc(sizeLog);
+	memset(infoLog, 0x0, sizeLog);
+
+	glGetShaderInfoLog(shader, sizeLog, &sizeLog, infoLog);
+	fprintf(stderr, "%s program link failed logsize %d log = %s\n", shader_name, sizeLog, infoLog);
+
+	free(infoLog);
+}
+
 GLint common_get_shader_program(const char *vertex_shader_source, const char *fragment_shader_source)
 {
 	enum Consts {INFOLOG_LEN = 512};
@@ -175,17 +192,24 @@ GLint common_get_shader_program(const char *vertex_shader_source, const char *fr
 	GLint vertex_shader;
 	GLint length;
 
-	vertex_shader = glCreateShader(GL_VERTEX_SHADER);CEGL();
-
-	glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);CEGL();
-	glCompileShader(vertex_shader);CEGL();
-	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);CEGL();
+	vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+	glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
+	glCompileShader(vertex_shader);
+	glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+	if (success == GL_FALSE) {
+		shader_dump_log(vertex_shader, "vertex_shader");
+		return success;
+	}
 
 	/* Fragment shader */
 	fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
 	glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
 	glCompileShader(fragment_shader);
 	glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+	if (success == GL_FALSE) {
+		shader_dump_log(fragment_shader, "fragment_shader");
+		return success;
+	}
 
 	/* Link shaders */
 	shader_program = glCreateProgram();
@@ -194,13 +218,20 @@ GLint common_get_shader_program(const char *vertex_shader_source, const char *fr
 	glLinkProgram(shader_program);
 	glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
 
+	if (success == GL_FALSE) {
+		shader_dump_log(fragment_shader, "program_link");
+		return success;
+	}
+
 	glDeleteShader(vertex_shader);
 	glDeleteShader(fragment_shader);
+
 	return shader_program;
 }
 
 int getDmaHeap(textureImage *texImage, const char *alloc_name)
 {
+	const char *cma = "/dev/dma_heap/linux,cma";
 	int ret;
 	int fd;
 
@@ -209,9 +240,11 @@ int getDmaHeap(textureImage *texImage, const char *alloc_name)
 		.fd_flags = O_RDWR | O_CLOEXEC,
 	};
 
-	fd = open("/dev/dma_heap/linux,cma", O_CLOEXEC | O_RDWR);
-	if (fd < 0)
+	fd = open(cma, O_CLOEXEC | O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Open of %s failed\n", cma);
 		return fd;
+	}
 
 	ret = ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &heap_data);
 	if (ret) {
@@ -244,7 +277,8 @@ int initEGLContext(EGLDisplay *display, int *fd, struct gbm_device **gbm)
 {
 	EGLContext context;
         EGLint configAttribs[] = {
-                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_CONFORMANT, EGL_OPENGL_ES2_BIT,
                 EGL_NONE
         };
         EGLint contextAttribs[] = {
@@ -321,6 +355,19 @@ int main(int argc, char *argv[])
 	int ret;
 	EGLint err;
 	EGLDisplay display;
+
+	struct texture_storage_metadata_t {
+		int fourcc;
+		EGLuint64KHR modifiers;
+		EGLint stride;
+		EGLint offset;
+	};
+
+        int texture_dmabuf_fd = -1;
+        struct texture_storage_metadata_t texture_storage_metadata;
+    
+        int num_planes;
+
 	if (loadBMP("Data/image2.bmp", &texImage))
 		return -1;
 
@@ -351,11 +398,15 @@ int main(int argc, char *argv[])
 	PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = NULL;
 	PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = NULL;
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
-
+	PFNEGLEXPORTDMABUFIMAGEQUERYMESAPROC eglExportDMABUFImageQueryMESA = NULL;
+	PFNEGLEXPORTDMABUFIMAGEMESAPROC eglExportDMABUFImageMESA = NULL;
+            
 	if (strstr(exts, "EGL_KHR_image") || strstr(exts, "EGL_KHR_image_base")) {
 		eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC) eglGetProcAddress("eglCreateImageKHR");
 		eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC) eglGetProcAddress("eglDestroyImageKHR");
 		glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES");
+		eglExportDMABUFImageQueryMESA = (PFNEGLEXPORTDMABUFIMAGEQUERYMESAPROC)eglGetProcAddress("eglExportDMABUFImageQueryMESA");
+		eglExportDMABUFImageMESA = (PFNEGLEXPORTDMABUFIMAGEMESAPROC)eglGetProcAddress("eglExportDMABUFImageMESA");
 	} else {
 		fprintf(stderr, "Display doesn't support required eGL extenions !\n");
 		ret = -ENODEV;
@@ -366,20 +417,6 @@ int main(int argc, char *argv[])
 	pos = glGetAttribLocation(shader_program, "position");
 	uvs = glGetAttribLocation(shader_program, "tx_coords");
 
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glViewport(0, 0, texImage.width, texImage.height);
-
-	glGenBuffers(1, &vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices)+sizeof(uv_coords), 0, GL_STATIC_DRAW);
-	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
-	glBufferSubData(GL_ARRAY_BUFFER, sizeof(vertices), sizeof(uv_coords), uv_coords);
-	glEnableVertexAttribArray(pos);
-	glEnableVertexAttribArray(uvs);
-	glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, 0, (GLvoid*)0);
-	glVertexAttribPointer(uvs, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid*)sizeof(vertices)); /// last is offset to loc in buf memory
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
-
 	EGLImageKHR dma_image;
 	dma_image = eglCreateImageKHR(display,
 				      EGL_NO_CONTEXT,
@@ -389,10 +426,10 @@ int main(int argc, char *argv[])
 					EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
 					EGL_WIDTH, texImage.width,
 					EGL_HEIGHT, texImage.height,
-					EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_RGB888,  /// takes 16 or 32 bits per pixel (or 8 probably)
+					EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,  /// takes 16 or 32 bits per pixel (or 8 probably)
 					EGL_DMA_BUF_PLANE0_FD_EXT, dmaFd,
 					EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-					EGL_DMA_BUF_PLANE0_PITCH_EXT, texImage.width * 3,
+					EGL_DMA_BUF_PLANE0_PITCH_EXT, texImage.width * 4,
 					EGL_NONE, EGL_NONE } );
 
 	if(dma_image == EGL_NO_IMAGE_KHR) { 
@@ -423,6 +460,47 @@ int main(int argc, char *argv[])
 		goto done;	
 	}
 
+	// Sanity check the created image
+	EGLBoolean queried = eglExportDMABUFImageQueryMESA(display,
+                                                           dma_image,
+                                                           &texture_storage_metadata.fourcc,
+                                                           &num_planes,
+                                                           &texture_storage_metadata.modifiers);
+        assert(queried);
+        assert(num_planes == 1);
+
+	EGLBoolean exported = eglExportDMABUFImageMESA(display,
+                                                       dma_image,
+                                                       &texture_dmabuf_fd,
+                                                       &texture_storage_metadata.stride,
+                                                       &texture_storage_metadata.offset);
+        assert(exported);
+
+        char *fourcc = (char*)&texture_storage_metadata.fourcc;
+        printf("texture_storage fourcc 0x%08x = %c%c%c%c planes 0x%08x modifiers 0x%08x stride 0x%08x offset 0x%08x\n",
+                texture_storage_metadata.fourcc,
+                fourcc[0],
+                fourcc[1],
+                fourcc[2],
+                fourcc[3],
+                texture_storage_metadata.modifiers,
+                texture_storage_metadata.stride,
+                texture_storage_metadata.offset);
+
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glViewport(0, 0, texImage.width, texImage.height);
+
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices)+sizeof(uv_coords), 0, GL_STATIC_DRAW);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+	glBufferSubData(GL_ARRAY_BUFFER, sizeof(vertices), sizeof(uv_coords), uv_coords);
+	glEnableVertexAttribArray(pos);
+	glEnableVertexAttribArray(uvs);
+	glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, 0, (GLvoid*)0);
+	glVertexAttribPointer(uvs, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid*)sizeof(vertices)); /// last is offset to loc in buf memory
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
 	GLuint dma_texture;
 	glGenTextures(1, &dma_texture);
 	glEnable(GL_TEXTURE_EXTERNAL_OES);
@@ -433,7 +511,55 @@ int main(int argc, char *argv[])
 	glGetUniformLocation(shader_program, "texture");
 
 	ret = 0;
+
+	glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+
+	glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, dma_image); CEGL();
+	glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT); CEGL();
+	glUseProgram(shader_program); CEGL();
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); CEGL();
+
+#if 0
+	eglSwapBuffers(display, EGL_NO_SURFACE); CEGL();
+#endif
+        int j = 0, i = 0;
+#if 0
+	char * pixels = malloc(texImage.width* texImage.width * 4);
+	glReadPixels(0, 0, texImage.width, texImage.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+        printf("Pixels: ");
+        for (;  i < texImage.width * texImage.height * 4; i++) {
+            printf("%x ", pixels[i]);
+            if (++j == 4) {
+                j = 0;
+                printf("\n");
+            }
+        }
+	free(pixels);
+#endif
+	texImage.dma_buf_out = mmap(NULL, texImage.imagesize, PROT_READ , MAP_SHARED, texture_dmabuf_fd, 0);
+	if (texImage.dma_buf_out == MAP_FAILED) {
+		fprintf(stderr, "Unable to mmap dmabuf errno %d %s\n", errno, strerror(errno));
+		goto done;
+	}
+
+        printf("DMA Pixels: ");
+        j = 0;
+        i = 0;
+        for (;  i < texImage.width * texImage.height * 4; i++) {
+            printf("%x ", texImage.dma_buf_out[i]);
+            if (++j == 4) {
+                j = 0;
+                printf("\n");
+            }
+        }
+
 done:
+	if (texImage.dma_buf_out != MAP_FAILED)
+		munmap(texImage.dma_buf_out, texImage.imagesize);
+	if (texture_dmabuf_fd > 0)
+		close(texture_dmabuf_fd);
+	eglDestroyImageKHR(display, dma_image);
 	free(texImage.data);
 	cleanup_gbm(fd, gbm);
 	if (texImage.dma_buf_in != MAP_FAILED)
